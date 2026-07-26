@@ -49,6 +49,9 @@ Next.js 쪽은 매 요청마다 그 테이블에서 최신 URL을 읽어간다 �
 python run.py
 ```
 
+매번 이렇게 치기 번거로우면 `start-server.bat`을 더블클릭하면 새 창에서 켜지고, `stop-server.bat`을
+더블클릭하면 꺼진다(또는 그냥 서버 창을 직접 닫아도 됨).
+
 - `GET /health` — 서버 상태 확인
 - `POST /separate` — JSON `{ "file_url": "https://.../stem-uploads/..." }`, 헤더 `X-API-Key: <API_KEY>` 필요
   → `{"job_id": "...", "status": "queued"}` 반환. 파일 자체를 요청 본문으로 안 받고 URL만 받아서 서버가 직접
