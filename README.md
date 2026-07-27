@@ -61,6 +61,9 @@ python run.py
   `completed` 시 `urls`에 `vocals`/`drums`/`bass`/`other`/`instrumental` Supabase Storage 공개 URL(mp3, 320kbps)이 담김.
   `instrumental`은 drums+bass+other를 ffmpeg `amix`로 합친 보컬 제외(반주) 트랙 — 재분리 없이 이미 나온 stem을
   섞기만 하는 거라 추가 비용이 거의 없음. ffmpeg 실패 시에도 나머지 4개 stem은 정상 반환되고 `instrumental`만 빠짐.
+  `progress`(0~100 정수)는 `status`가 `processing`일 때 Demucs가 찍는 tqdm 진행률을 실시간으로 파싱해서 채워줌
+  — `htdemucs_ft`는 stem 전담 모델 4개가 순서대로 도는 구조라(`DEMUCS_MODEL_PASSES`), 그 4단계를 하나의 0~100
+  값으로 환산함. `uploading`/`completed`로 넘어가면 100.
 
 동시에 여러 곡을 요청해도 서버 내부에서 큐로 순차 처리한다(CPU 코어를 Demucs `-j 16`이 이미 최대로 쓰기 때문에
 동시 처리 시 오히려 전체 시간이 늘어남).

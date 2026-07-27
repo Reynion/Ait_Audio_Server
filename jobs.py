@@ -19,6 +19,7 @@ class Job:
     job_id: str
     filename: str
     status: JobStatus = JobStatus.QUEUED
+    progress: int = 0
     error: Optional[str] = None
     urls: dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
@@ -29,6 +30,7 @@ class Job:
             "job_id": self.job_id,
             "filename": self.filename,
             "status": self.status.value,
+            "progress": self.progress,
             "error": self.error,
             "urls": self.urls,
             "created_at": self.created_at,

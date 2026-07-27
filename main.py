@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,8 @@ if FFMPEG_DIR:
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 STEMS = ("vocals", "drums", "bass", "other")
 DEMUCS_MODEL = "htdemucs_ft"
+DEMUCS_MODEL_PASSES = 4  # htdemucs_ft는 stem별 전담 모델 4개짜리 앙상블이라 진행률 바가 4번 반복됨. DEMUCS_MODEL 바꾸면 같이 바꿀 것.
+PROGRESS_PATTERN = re.compile(r"(\d{1,3})%\|")
 API_KEY = os.getenv("API_KEY")
 
 # CPU 한 대에서 Demucs(-j 16)를 동시에 여러 개 돌리면 코어를 나눠 쓰게 되어
@@ -153,24 +156,55 @@ def build_instrumental(stem_dir: Path) -> Path | None:
     return output_path
 
 
+def run_demucs(job_id: str, input_path: Path, job_output_dir: Path) -> None:
+    """Demucs를 서브프로세스로 돌리면서 tqdm 진행률(%) 출력을 실시간으로 읽어 job.progress에 반영한다."""
+    cmd = [
+        sys.executable, "-m", "demucs",
+        "-n", DEMUCS_MODEL,
+        "--device", "cpu",
+        "-j", "16",
+        "--overlap", "0.5",
+        "--mp3", "--mp3-bitrate", "320",
+        "-o", str(job_output_dir),
+        str(input_path),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    output_lines: list[str] = []
+    pass_index = 0
+    last_percent = 0
+    for line in proc.stdout:
+        output_lines.append(line)
+        match = PROGRESS_PATTERN.search(line)
+        if not match:
+            continue
+        percent = int(match.group(1))
+        if percent < last_percent - 20:
+            # 퍼센트가 갑자기 뚝 떨어짐 = 다음 stem 전담 모델(pass)로 넘어간 것
+            pass_index = min(pass_index + 1, DEMUCS_MODEL_PASSES - 1)
+        last_percent = percent
+        overall = min(99, (pass_index * 100 + percent) // DEMUCS_MODEL_PASSES)
+        jobs.update(job_id, progress=overall)
+
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Demucs 처리 실패: {''.join(output_lines)[-2000:]}")
+    jobs.update(job_id, progress=100)
+
+
 def process_job(job_id: str, input_path: Path) -> None:
     job_output_dir = OUTPUT_DIR / job_id
     try:
-        jobs.update(job_id, status=JobStatus.PROCESSING)
-
-        cmd = [
-            sys.executable, "-m", "demucs",
-            "-n", DEMUCS_MODEL,
-            "--device", "cpu",
-            "-j", "16",
-            "--overlap", "0.5",
-            "--mp3", "--mp3-bitrate", "320",
-            "-o", str(job_output_dir),
-            str(input_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Demucs 처리 실패: {result.stderr[-2000:]}")
+        jobs.update(job_id, status=JobStatus.PROCESSING, progress=0)
+        run_demucs(job_id, input_path, job_output_dir)
 
         stem_dir = job_output_dir / DEMUCS_MODEL / input_path.stem
 
