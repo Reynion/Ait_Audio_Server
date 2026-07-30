@@ -1,2 +1,2 @@
 @echo off
-start "Demucs Server" cmd /k "%~dp0_run-server.bat"
+start "ait_audio_server" cmd /k "%~dp0_run-server.bat"

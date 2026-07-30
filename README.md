@@ -1,14 +1,15 @@
-# Demucs 음원 분리 로컬 서버
+# ait_audio_server
 
-AIT 프로젝트(Next.js)에서 사용할 음원 분리(Demucs) FastAPI 서버. Windows 로컬 PC(CPU 전용)에서
-실행하고, Cloudflare Tunnel로 외부(Vercel에 배포된 Next.js)에서 접근할 수 있게 한다.
+ait_projekt(Next.js)에서 쓰는 오디오 처리 로컬 서버. 음원 분리(Demucs)와 유튜브 오디오 추출을
+담당한다. Windows 로컬 PC(CPU 전용)에서 실행하고, Cloudflare Tunnel로 외부(Vercel에 배포된
+Next.js)에서 접근할 수 있게 한다. (예전 이름: MusicSeparator — 음원 분리 외 기능이 추가되면서 개명함)
 
 ## 1. 가상환경 생성 및 패키지 설치
 
 PowerShell 기준:
 
 ```powershell
-cd E:\MusicSeparator
+cd E:\ait_audio_server
 python -m venv demucs-env
 .\demucs-env\Scripts\Activate.ps1
 pip install --upgrade pip

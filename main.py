@@ -53,7 +53,7 @@ CLEANUP_INTERVAL_SECONDS = 15 * 60
 UPLOAD_RETENTION_HOURS = 24
 RESULT_RETENTION_HOURS = 1
 
-app = FastAPI(title="Demucs Separator Server")
+app = FastAPI(title="ait_audio_server")
 
 
 def cleanup_loop() -> None:
