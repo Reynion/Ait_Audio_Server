@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from jobs import JobStatus, jobs
 from supabase_client import (
     BUCKET,
+    PITCH_SPEED_BUCKET,
     UPLOAD_BUCKET,
     YOUTUBE_BUCKET,
     cleanup_old_objects,
@@ -29,6 +30,7 @@ from supabase_client import (
     download_stem,
     get_stem_public_url,
     upload_mix,
+    upload_pitch_speed_audio,
     upload_stem,
     upload_youtube_audio,
 )
@@ -60,6 +62,10 @@ API_KEY = os.getenv("API_KEY")
 YOUTUBE_HOSTS_SUFFIX = ("youtube.com", "youtu.be")
 YOUTUBE_MAX_DURATION_SECONDS = 30 * 60
 
+# 프론트 슬라이더 범위(속도 0.5~2.0배, 피치 ±12반음)와 맞춤 — 서버에서도 같은 범위로 검증한다.
+PITCH_SPEED_TEMPO_RANGE = (0.5, 2.0)
+PITCH_SPEED_PITCH_RANGE = (-12, 12)
+
 # CPU 한 대에서 Demucs(-j 16)를 동시에 여러 개 돌리면 코어를 나눠 쓰게 되어
 # 오히려 전체 처리 시간이 늘어나므로, 워커 1개로 작업을 순차 처리한다.
 executor = ThreadPoolExecutor(max_workers=1)
@@ -71,6 +77,7 @@ CLEANUP_INTERVAL_SECONDS = 15 * 60
 UPLOAD_RETENTION_HOURS = 24
 RESULT_RETENTION_HOURS = 1
 YOUTUBE_RETENTION_HOURS = 0.25
+PITCH_SPEED_RETENTION_HOURS = 0.25
 
 app = FastAPI(title="ait_audio_server")
 
@@ -81,9 +88,10 @@ def cleanup_loop() -> None:
             n_uploads = cleanup_old_objects(UPLOAD_BUCKET, UPLOAD_RETENTION_HOURS / 24)
             n_results = cleanup_old_objects(BUCKET, RESULT_RETENTION_HOURS / 24)
             n_youtube = cleanup_old_objects(YOUTUBE_BUCKET, YOUTUBE_RETENTION_HOURS / 24)
+            n_pitch_speed = cleanup_old_objects(PITCH_SPEED_BUCKET, PITCH_SPEED_RETENTION_HOURS / 24)
             print(
                 f"[cleanup] {UPLOAD_BUCKET} {n_uploads}개, {BUCKET} {n_results}개, "
-                f"{YOUTUBE_BUCKET} {n_youtube}개 삭제",
+                f"{YOUTUBE_BUCKET} {n_youtube}개, {PITCH_SPEED_BUCKET} {n_pitch_speed}개 삭제",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -122,6 +130,12 @@ class MixItem(BaseModel):
 class MixRequest(BaseModel):
     job_id: str
     mixes: list[MixItem]
+
+
+class PitchSpeedRequest(BaseModel):
+    file_url: str
+    tempo: float = 1.0
+    pitch: float = 0.0
 
 
 @app.get("/health")
@@ -235,6 +249,56 @@ def mix(
     executor.submit(process_mix_job, job_id2, body.job_id, body.mixes)
 
     return {"job_id": job_id2, "status": JobStatus.QUEUED.value}
+
+
+@app.post("/pitch-speed")
+async def pitch_speed(
+    body: PitchSpeedRequest,
+    x_api_key: str | None = Header(default=None),
+) -> dict:
+    """rubberband(ffmpeg 필터)로 피치/속도를 조절한다. 프론트의 실시간 미리듣기(SoundTouch.js, 클라이언트)는
+    그대로 두고, 최종 내보내기만 이 엔드포인트로 돌려서 포먼트 보존 등 더 나은 품질을 준다."""
+    verify_api_key(x_api_key)
+
+    if not (PITCH_SPEED_TEMPO_RANGE[0] <= body.tempo <= PITCH_SPEED_TEMPO_RANGE[1]):
+        raise HTTPException(
+            status_code=400,
+            detail=f"tempo는 {PITCH_SPEED_TEMPO_RANGE[0]}~{PITCH_SPEED_TEMPO_RANGE[1]} 범위여야 합니다.",
+        )
+    if not (PITCH_SPEED_PITCH_RANGE[0] <= body.pitch <= PITCH_SPEED_PITCH_RANGE[1]):
+        raise HTTPException(
+            status_code=400,
+            detail=f"pitch는 {PITCH_SPEED_PITCH_RANGE[0]}~{PITCH_SPEED_PITCH_RANGE[1]} 범위여야 합니다.",
+        )
+
+    url_path = Path(urlparse(body.file_url).path)
+    ext = url_path.suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="mp3, wav, flac, ogg, m4a 파일만 지원합니다.")
+
+    job_id = uuid.uuid4().hex
+    job_upload_dir = UPLOAD_DIR / job_id
+    job_upload_dir.mkdir(parents=True, exist_ok=True)
+    input_path = job_upload_dir / f"input{ext}"
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(body.file_url)
+            resp.raise_for_status()
+            input_path.write_bytes(resp.content)
+    except httpx.HTTPError as exc:
+        shutil.rmtree(job_upload_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"파일 다운로드 실패: {exc}")
+
+    try:
+        delete_upload(body.file_url)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[pitch-speed] stem-uploads 원본 삭제 실패(무시하고 계속 진행): {exc}", flush=True)
+
+    jobs.create(job_id, filename=url_path.name or input_path.name)
+    executor.submit(process_pitch_speed_job, job_id, input_path, body.tempo, body.pitch)
+
+    return {"job_id": job_id, "status": JobStatus.QUEUED.value}
 
 
 INSTRUMENTAL_SOURCE_STEMS = ("drums", "bass", "other")
@@ -442,6 +506,42 @@ def process_mix_job(job_id2: str, source_job_id: str, mix_items: list[MixItem]) 
         jobs.update(job_id2, status=JobStatus.FAILED, error=str(exc))
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def run_pitch_speed_ffmpeg(input_path: Path, output_path: Path, tempo: float, pitch_semitones: float) -> None:
+    """ffmpeg rubberband 필터로 피치/속도를 조절한다. pitch는 반음 단위로 받아서
+    rubberband가 요구하는 배율(scale factor)로 환산한다(2^(반음/12))."""
+    pitch_scale = 2 ** (pitch_semitones / 12)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-af", f"rubberband=tempo={tempo}:pitch={pitch_scale}:formant=preserved",
+        "-b:a", "320k",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not output_path.exists():
+        raise RuntimeError(f"피치/속도 조절 실패: {result.stderr[-2000:]}")
+
+
+def process_pitch_speed_job(job_id: str, input_path: Path, tempo: float, pitch: float) -> None:
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        jobs.update(job_id, status=JobStatus.PROCESSING, progress=20)
+        output_path = job_dir / "output.mp3"
+        run_pitch_speed_ffmpeg(input_path, output_path, tempo, pitch)
+        jobs.update(job_id, progress=80)
+
+        jobs.update(job_id, status=JobStatus.UPLOADING)
+        audio_url = upload_pitch_speed_audio(job_id, output_path)
+
+        jobs.update(job_id, status=JobStatus.COMPLETED, progress=100, urls={"audio": audio_url})
+    except Exception as exc:  # noqa: BLE001
+        jobs.update(job_id, status=JobStatus.FAILED, error=str(exc))
+    finally:
+        shutil.rmtree(input_path.parent, ignore_errors=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @app.exception_handler(Exception)
