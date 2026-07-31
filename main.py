@@ -26,6 +26,9 @@ from supabase_client import (
     YOUTUBE_BUCKET,
     cleanup_old_objects,
     delete_upload,
+    download_stem,
+    get_stem_public_url,
+    upload_mix,
     upload_stem,
     upload_youtube_audio,
 )
@@ -46,6 +49,7 @@ if FFMPEG_DIR:
 
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 STEMS = ("vocals", "drums", "bass", "other")
+VALID_STEMS = set(STEMS)
 DEMUCS_MODEL = "htdemucs_ft"
 DEMUCS_MODEL_PASSES = 4  # htdemucs_ft는 stem별 전담 모델 4개짜리 앙상블이라 진행률 바가 4번 반복됨. DEMUCS_MODEL 바꾸면 같이 바꿀 것.
 PROGRESS_PATTERN = re.compile(r"(\d{1,3})%\|")
@@ -108,6 +112,16 @@ class SeparateRequest(BaseModel):
 
 class YoutubeAudioRequest(BaseModel):
     url: str
+
+
+class MixItem(BaseModel):
+    key: str
+    stems: list[str]
+
+
+class MixRequest(BaseModel):
+    job_id: str
+    mixes: list[MixItem]
 
 
 @app.get("/health")
@@ -188,16 +202,46 @@ def youtube_audio(
     return {"job_id": job_id, "status": JobStatus.QUEUED.value}
 
 
+@app.post("/mix")
+def mix(
+    body: MixRequest,
+    x_api_key: str | None = Header(default=None),
+) -> dict:
+    """분리 결과가 이미 나온 곡에서, 원하는 파트 조합을 그때그때 여러 개 골라서 섞어 받는다.
+    재분리 없이 이미 업로드된 stem mp3들을 다운로드/믹싱만 하므로 비용이 낮다."""
+    verify_api_key(x_api_key)
+
+    if not body.mixes:
+        raise HTTPException(status_code=400, detail="mixes가 비어있습니다.")
+
+    seen_keys: set[str] = set()
+    for item in body.mixes:
+        if not item.key:
+            raise HTTPException(status_code=400, detail="key가 비어있는 항목이 있습니다.")
+        if item.key in seen_keys:
+            raise HTTPException(status_code=400, detail=f"key가 중복되었습니다: {item.key}")
+        seen_keys.add(item.key)
+
+        if not item.stems:
+            raise HTTPException(status_code=400, detail=f"{item.key}: stems가 비어있습니다.")
+        if len(set(item.stems)) != len(item.stems):
+            raise HTTPException(status_code=400, detail=f"{item.key}: stems 안에 중복된 값이 있습니다.")
+        unknown = set(item.stems) - VALID_STEMS
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"{item.key}: 알 수 없는 stem입니다: {sorted(unknown)}")
+
+    job_id2 = uuid.uuid4().hex
+    jobs.create(job_id2, filename=f"mix of {body.job_id}")
+    executor.submit(process_mix_job, job_id2, body.job_id, body.mixes)
+
+    return {"job_id": job_id2, "status": JobStatus.QUEUED.value}
+
+
 INSTRUMENTAL_SOURCE_STEMS = ("drums", "bass", "other")
 
 
-def build_instrumental(stem_dir: Path) -> Path | None:
-    """보컬을 뺀 나머지 stem들을 합쳐 반주(instrumental) 트랙을 만든다."""
-    inputs = [stem_dir / f"{s}.mp3" for s in INSTRUMENTAL_SOURCE_STEMS if (stem_dir / f"{s}.mp3").exists()]
-    if len(inputs) < 2:
-        return None
-
-    output_path = stem_dir / "instrumental.mp3"
+def mix_stems_ffmpeg(inputs: list[Path], output_path: Path) -> bool:
+    """여러 mp3 stem을 재분리 없이 ffmpeg amix로 하나로 섞는다."""
     cmd = ["ffmpeg", "-y"]
     for p in inputs:
         cmd += ["-i", str(p)]
@@ -208,7 +252,19 @@ def build_instrumental(stem_dir: Path) -> Path | None:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or not output_path.exists():
-        print(f"[separate] 반주 트랙 생성 실패(무시하고 계속 진행): {result.stderr[-500:]}", flush=True)
+        print(f"[mix] ffmpeg 믹싱 실패: {result.stderr[-500:]}", flush=True)
+        return False
+    return True
+
+
+def build_instrumental(stem_dir: Path) -> Path | None:
+    """보컬을 뺀 나머지 stem들을 합쳐 반주(instrumental) 트랙을 만든다."""
+    inputs = [stem_dir / f"{s}.mp3" for s in INSTRUMENTAL_SOURCE_STEMS if (stem_dir / f"{s}.mp3").exists()]
+    if len(inputs) < 2:
+        return None
+
+    output_path = stem_dir / "instrumental.mp3"
+    if not mix_stems_ffmpeg(inputs, output_path):
         return None
     return output_path
 
@@ -337,6 +393,55 @@ def process_youtube_job(job_id: str, url: str) -> None:
         jobs.update(job_id, status=JobStatus.FAILED, error=str(exc))
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def process_mix_job(job_id2: str, source_job_id: str, mix_items: list[MixItem]) -> None:
+    work_dir = OUTPUT_DIR / job_id2
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        jobs.update(job_id2, status=JobStatus.PROCESSING, progress=0)
+
+        # 조합들이 요구하는 stem을 합쳐서 필요한 것만 한 번씩 받는다(같은 stem을 여러 조합이
+        # 같이 써도 중복 다운로드하지 않기 위함). 존재하지 않으면(원본이 1시간 지나 만료됨 등)
+        # 그 stem이 빠진 채로 넘어가고, 그 stem이 필요한 조합만 나중에 스킵된다.
+        needed_stems = sorted({s for item in mix_items for s in item.stems})
+        stem_paths: dict[str, Path] = {}
+        for stem in needed_stems:
+            try:
+                data = download_stem(source_job_id, stem)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[mix] {source_job_id}/{stem} 다운로드 실패(만료되었을 수 있음): {exc}", flush=True)
+                continue
+            stem_path = work_dir / f"{stem}.mp3"
+            stem_path.write_bytes(data)
+            stem_paths[stem] = stem_path
+
+        jobs.update(job_id2, status=JobStatus.UPLOADING, progress=30)
+
+        urls: dict[str, str] = {}
+        total = len(mix_items)
+        for i, item in enumerate(mix_items):
+            available = [s for s in item.stems if s in stem_paths]
+            if len(available) != len(item.stems):
+                continue  # 필요한 stem 중 일부가 만료/누락 -> 이 조합은 스킵
+
+            if len(available) == 1:
+                urls[item.key] = get_stem_public_url(source_job_id, available[0])
+            else:
+                output_path = work_dir / f"mix_{item.key}.mp3"
+                if mix_stems_ffmpeg([stem_paths[s] for s in available], output_path):
+                    urls[item.key] = upload_mix(source_job_id, item.key, output_path)
+
+            jobs.update(job_id2, progress=min(99, 30 + int((i + 1) / total * 69)))
+
+        if not urls:
+            raise RuntimeError("생성된 조합이 없습니다(원본 stem이 만료되었거나 job_id가 잘못됐을 수 있습니다).")
+
+        jobs.update(job_id2, status=JobStatus.COMPLETED, progress=100, urls=urls)
+    except Exception as exc:  # noqa: BLE001
+        jobs.update(job_id2, status=JobStatus.FAILED, error=str(exc))
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.exception_handler(Exception)

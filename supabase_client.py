@@ -44,6 +44,30 @@ def upload_stem(job_id: str, stem_name: str, file_path: Path) -> str:
     return client.storage.from_(BUCKET).get_public_url(storage_path)
 
 
+def download_stem(job_id: str, stem_name: str) -> bytes:
+    """분리 결과 stem mp3를 Supabase Storage에서 직접 받아온다(퍼블릭 URL을 안 거치므로,
+    존재하지 않으면 예외가 그대로 올라와 만료/오탈자 job_id를 구분하는 용도로도 쓴다)."""
+    client = get_supabase()
+    return client.storage.from_(BUCKET).download(f"{job_id}/{stem_name}.mp3")
+
+
+def get_stem_public_url(job_id: str, stem_name: str) -> str:
+    client = get_supabase()
+    return client.storage.from_(BUCKET).get_public_url(f"{job_id}/{stem_name}.mp3")
+
+
+def upload_mix(job_id: str, key: str, file_path: Path) -> str:
+    client = get_supabase()
+    storage_path = f"{job_id}/mix_{key}.mp3"
+    data = file_path.read_bytes()
+    client.storage.from_(BUCKET).upload(
+        storage_path,
+        data,
+        {"content-type": "audio/mpeg", "upsert": "true"},
+    )
+    return client.storage.from_(BUCKET).get_public_url(storage_path)
+
+
 def upload_youtube_audio(job_id: str, file_path: Path) -> str:
     client = get_supabase()
     storage_path = f"{job_id}/audio{file_path.suffix}"
