@@ -36,6 +36,8 @@ copy .env.example .env
 - `SUPABASE_BUCKET`: 기본값 `separated-audio` — 분리 결과(vocals/drums/bass/other) 저장용, public
 - `SUPABASE_UPLOAD_BUCKET`: 기본값 `stem-uploads` — Next.js가 올려주는 원본 파일을 받는 용도, public,
   50MB 제한(Supabase 프로젝트 플랜의 전역 업로드 한도 때문에 이 이상은 프로젝트 설정을 먼저 올려야 함)
+- `SUPABASE_YOUTUBE_BUCKET`: 기본값 `youtube-audio` — 유튜브에서 추출한 오디오(mp3) 저장용, public.
+  버킷이 없으면 Supabase 대시보드(Storage → New bucket, public으로 생성)에서 미리 만들어야 함.
 - `API_KEY`: Cloudflare Tunnel로 외부에 노출되는 서버이므로, 임의의 값을 넣어 인증 없는 요청을 막는 것을 권장.
   설정하면 Next.js 쪽에서 모든 요청에 `X-API-Key` 헤더를 함께 보내야 함.
 
@@ -65,9 +67,15 @@ python run.py
   `progress`(0~100 정수)는 `status`가 `processing`일 때 Demucs가 찍는 tqdm 진행률을 실시간으로 파싱해서 채워줌
   — `htdemucs_ft`는 stem 전담 모델 4개가 순서대로 도는 구조라(`DEMUCS_MODEL_PASSES`), 그 4단계를 하나의 0~100
   값으로 환산함. `uploading`/`completed`로 넘어가면 100.
+- `POST /youtube-audio` — JSON `{ "url": "https://www.youtube.com/watch?v=..." }`, 헤더 `X-API-Key: <API_KEY>` 필요
+  → `{"job_id": "...", "status": "queued"}` 반환. 응답 전에 영상 메타데이터만 먼저 조회해 검증한다:
+  (1) `youtube.com`/`youtu.be` 도메인이 아니면 즉시 400(yt-dlp가 1800개+ 사이트를 지원하므로, 검증 없이 넘기면
+  범용 다운로드 프록시로 악용될 수 있어 화이트리스트로 막음), (2) 영상 길이가 30분을 넘으면 즉시 400(실제
+  다운로드 전에 걸러냄). 재생목록 링크를 넣어도 `noplaylist` 옵션으로 그 영상 하나만 처리한다. 처리는 `/status`를
+  그대로 재사용(같은 job/status 시스템)하며, 완료 시 `urls`에 `audio` 하나만 담겨 온다(mp3, 320kbps).
 
-동시에 여러 곡을 요청해도 서버 내부에서 큐로 순차 처리한다(CPU 코어를 Demucs `-j 16`이 이미 최대로 쓰기 때문에
-동시 처리 시 오히려 전체 시간이 늘어남).
+동시에 여러 곡/영상을 요청해도 서버 내부에서 워커 1개짜리 큐로 순차 처리한다(CPU 코어를 Demucs `-j 16`이
+이미 최대로 쓰기 때문에 동시 처리 시 오히려 전체 시간이 늘어남 — 유튜브 오디오 추출도 같은 큐를 공유함).
 
 cloudflared 실행파일이 없다면 아래로 다시 받는다 (`cloudflared/` 폴더는 용량 때문에 git에 커밋하지 않음):
 
@@ -112,6 +120,9 @@ using (bucket_id = 'stem-uploads');
 - 3~5분짜리 곡 기준 CPU 처리 시간 약 3~5분(`htdemucs` 기준. `htdemucs_ft`는 그보다 오래 걸림)
 - 처리 완료/실패 후 로컬 업로드 파일과 Demucs 산출물은 자동 삭제됨(Supabase Storage에만 보관)
 - Supabase Storage 정리: `stem-uploads`(원본)는 다운로드 직후 즉시 삭제, `separated-audio`(결과)는
-  업로드 후 1시간 지나면 자동 삭제됨(다시 뽑는 비용이 크지 않아 짧게 잡음). 서버 시작 시 한 번 +
-  이후 15분마다 정리 스레드가 돎. 보관 기간은 `main.py`의 `UPLOAD_RETENTION_HOURS`/`RESULT_RETENTION_HOURS`로,
-  정리 주기는 `CLEANUP_INTERVAL_SECONDS`로 조절 가능.
+  업로드 후 1시간 지나면, `youtube-audio`(추출 결과)는 업로드 후 15분 지나면 자동 삭제됨(다시 뽑는 비용이
+  크지 않아 짧게 잡음). 서버 시작 시 한 번 + 이후 15분마다 정리 스레드가 돎. 보관 기간은 `main.py`의
+  `UPLOAD_RETENTION_HOURS`/`RESULT_RETENTION_HOURS`/`YOUTUBE_RETENTION_HOURS`로, 정리 주기는
+  `CLEANUP_INTERVAL_SECONDS`로 조절 가능.
+- 유튜브 오디오 추출은 `yt-dlp` + FFmpeg(`FFmpegExtractAudio` 후처리)로 mp3 320kbps 변환까지 하므로,
+  m4a 디코딩용으로 이미 설정해둔 `FFMPEG_DIR`을 그대로 재사용함(별도 설정 불필요).

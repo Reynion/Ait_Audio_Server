@@ -13,13 +13,22 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+import yt_dlp
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from jobs import JobStatus, jobs
-from supabase_client import BUCKET, UPLOAD_BUCKET, cleanup_old_objects, delete_upload, upload_stem
+from supabase_client import (
+    BUCKET,
+    UPLOAD_BUCKET,
+    YOUTUBE_BUCKET,
+    cleanup_old_objects,
+    delete_upload,
+    upload_stem,
+    upload_youtube_audio,
+)
 
 load_dotenv()
 
@@ -42,6 +51,11 @@ DEMUCS_MODEL_PASSES = 4  # htdemucs_ft는 stem별 전담 모델 4개짜리 앙�
 PROGRESS_PATTERN = re.compile(r"(\d{1,3})%\|")
 API_KEY = os.getenv("API_KEY")
 
+# yt-dlp가 1800개+ 사이트를 지원하기 때문에 도메인 검증 없이 URL을 넘기면 범용 다운로드
+# 프록시로 악용될 수 있어, 유튜브 도메인만 허용한다.
+YOUTUBE_HOSTS_SUFFIX = ("youtube.com", "youtu.be")
+YOUTUBE_MAX_DURATION_SECONDS = 30 * 60
+
 # CPU 한 대에서 Demucs(-j 16)를 동시에 여러 개 돌리면 코어를 나눠 쓰게 되어
 # 오히려 전체 처리 시간이 늘어나므로, 워커 1개로 작업을 순차 처리한다.
 executor = ThreadPoolExecutor(max_workers=1)
@@ -52,6 +66,7 @@ executor = ThreadPoolExecutor(max_workers=1)
 CLEANUP_INTERVAL_SECONDS = 15 * 60
 UPLOAD_RETENTION_HOURS = 24
 RESULT_RETENTION_HOURS = 1
+YOUTUBE_RETENTION_HOURS = 0.25
 
 app = FastAPI(title="ait_audio_server")
 
@@ -61,7 +76,12 @@ def cleanup_loop() -> None:
         try:
             n_uploads = cleanup_old_objects(UPLOAD_BUCKET, UPLOAD_RETENTION_HOURS / 24)
             n_results = cleanup_old_objects(BUCKET, RESULT_RETENTION_HOURS / 24)
-            print(f"[cleanup] {UPLOAD_BUCKET} {n_uploads}개, {BUCKET} {n_results}개 삭제", flush=True)
+            n_youtube = cleanup_old_objects(YOUTUBE_BUCKET, YOUTUBE_RETENTION_HOURS / 24)
+            print(
+                f"[cleanup] {UPLOAD_BUCKET} {n_uploads}개, {BUCKET} {n_results}개, "
+                f"{YOUTUBE_BUCKET} {n_youtube}개 삭제",
+                flush=True,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[cleanup] 실패: {exc}", flush=True)
         time.sleep(CLEANUP_INTERVAL_SECONDS)
@@ -77,8 +97,17 @@ def verify_api_key(x_api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다.")
 
 
+def is_allowed_youtube_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in YOUTUBE_HOSTS_SUFFIX or any(host.endswith(f".{suffix}") for suffix in YOUTUBE_HOSTS_SUFFIX)
+
+
 class SeparateRequest(BaseModel):
     file_url: str
+
+
+class YoutubeAudioRequest(BaseModel):
+    url: str
 
 
 @app.get("/health")
@@ -129,6 +158,34 @@ def status(job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="존재하지 않는 job_id 입니다.")
     return job.to_dict()
+
+
+@app.post("/youtube-audio")
+def youtube_audio(
+    body: YoutubeAudioRequest,
+    x_api_key: str | None = Header(default=None),
+) -> dict:
+    """비동기 def가 아닌 이유: yt_dlp 호출이 블로킹이라, FastAPI가 자동으로 돌려주는
+    스레드풀에서 실행되도록 동기 함수로 둔다(이벤트 루프를 막지 않기 위함)."""
+    verify_api_key(x_api_key)
+    if not is_allowed_youtube_host(body.url):
+        raise HTTPException(status_code=400, detail="youtube.com 또는 youtu.be 링크만 지원합니다.")
+
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}) as ydl:
+        try:
+            info = ydl.extract_info(body.url, download=False)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"영상 정보를 가져오지 못했습니다: {exc}")
+
+    duration = info.get("duration") or 0
+    if duration > YOUTUBE_MAX_DURATION_SECONDS:
+        raise HTTPException(status_code=400, detail="30분을 초과하는 영상은 지원하지 않습니다.")
+
+    job_id = uuid.uuid4().hex
+    jobs.create(job_id, filename=info.get("title") or job_id)
+    executor.submit(process_youtube_job, job_id, body.url)
+
+    return {"job_id": job_id, "status": JobStatus.QUEUED.value}
 
 
 INSTRUMENTAL_SOURCE_STEMS = ("drums", "bass", "other")
@@ -231,6 +288,55 @@ def process_job(job_id: str, input_path: Path) -> None:
     finally:
         shutil.rmtree(input_path.parent, ignore_errors=True)
         shutil.rmtree(job_output_dir, ignore_errors=True)
+
+
+def make_youtube_progress_hook(job_id: str):
+    def hook(d: dict) -> None:
+        if d.get("status") != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        downloaded = d.get("downloaded_bytes", 0)
+        if total:
+            # 다운로드 완료 후 mp3 변환(ffmpeg 후처리)이 남아있으므로 100%는 아껴둔다.
+            jobs.update(job_id, progress=min(99, int(downloaded / total * 99)))
+    return hook
+
+
+def process_youtube_job(job_id: str, url: str) -> None:
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        jobs.update(job_id, status=JobStatus.PROCESSING, progress=0)
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format": "bestaudio/best",
+            "outtmpl": str(job_dir / "audio.%(ext)s"),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "320",
+            }],
+            "progress_hooks": [make_youtube_progress_hook(job_id)],
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        jobs.update(job_id, progress=100)
+
+        output_path = job_dir / "audio.mp3"
+        if not output_path.exists():
+            raise RuntimeError("오디오 추출 결과 파일을 찾을 수 없습니다.")
+
+        jobs.update(job_id, status=JobStatus.UPLOADING)
+        audio_url = upload_youtube_audio(job_id, output_path)
+
+        jobs.update(job_id, status=JobStatus.COMPLETED, urls={"audio": audio_url})
+    except Exception as exc:  # noqa: BLE001
+        jobs.update(job_id, status=JobStatus.FAILED, error=str(exc))
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @app.exception_handler(Exception)
