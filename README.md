@@ -164,14 +164,17 @@ using (bucket_id = 'stem-uploads');
 - **GPU 모드**: `main.py`가 시작할 때 `torch.cuda.is_available()`로 자동 감지해서 `DEMUCS_DEVICE`를
   `cpu`/`cuda`로, `-j`(병렬 작업 수)도 그에 맞게(CPU 16, GPU 1) 정한다. 즉 코드는 안 건드리고 어느
   가상환경(`demucs-env` vs `demucs-env-gpu`)으로 서버를 띄웠는지에 따라 자동으로 결정됨 — 1번 항목 참고.
-  GPU 쪽 `-j`(기본 1)는 카드 VRAM에 따라 `.env`의 `DEMUCS_GPU_JOBS`로 조절 가능(값을 올리면 청크를 동시에
-  여러 개 GPU에 밀어넣어 빨라질 수 있지만 VRAM 부족으로 실패할 수도 있음).
+  GPU 쪽 `-j`(기본 1)는 `.env`의 `DEMUCS_GPU_JOBS`로 조절 가능하지만, **실측해보니 1→4로 올려도 속도
+  차이가 없었음**(96초 vs 90초, 오차 범위) — `-j 1`에서 이미 GPU 사용률이 90~100%로 꽉 차서 GPU 자체가
+  병목이라 청크를 더 동시에 밀어넣어도 의미 없었던 것으로 보임. 굳이 건드릴 필요 없이 기본값(1)이면 충분.
 - 모델은 `htdemucs_ft`(4-모델 앙상블 파인튜닝, 품질 우선) 사용 중. `main.py`의 `DEMUCS_MODEL`을 `htdemucs`로
   바꾸면 품질은 약간 떨어지지만 약 4배 빠름.
 - `--overlap 0.5`(기본 0.25)로 구간 경계 이음새 아티팩트를 줄임. 처리해야 할 구간 수가 늘어나 조금 느려지지만
   `--shifts`처럼 배수로 곱해지는 게 아니라 완만하게(대략 1.5배) 늘어나는 정도라 비용 대비 효과가 좋음.
-- 3~5분짜리 곡 기준 CPU 처리 시간 약 3~5분(`htdemucs` 기준. `htdemucs_ft`는 그보다 오래 걸림). GPU는
-  카드에 따라 다르지만 통상 수 초~수십 초 수준으로 훨씬 빠름.
+- **실측 처리 시간/VRAM**(`htdemucs_ft` + `--overlap 0.5`, 6분37초 실제 곡, i7-14700K / RTX 3070 기준):
+  CPU 285초(4분45초) vs GPU 90초(1분30초) — 약 3.2배 빠름. GPU 피크 VRAM은 약 2.8GB(짧은 클립도 비슷한
+  수준 — 세그먼트 단위 처리라 곡 길이보다 세그먼트 크기가 VRAM을 좌우함). 다른 CPU/GPU 조합이면 배수는
+  달라질 수 있음.
 - 처리 완료/실패 후 로컬 업로드 파일과 Demucs 산출물은 자동 삭제됨(Supabase Storage에만 보관)
 - Supabase Storage 정리: `stem-uploads`(원본)는 다운로드 직후 즉시 삭제, `separated-audio`(결과)는
   업로드 후 1시간 지나면, `youtube-audio`/`pitch-speed-audio`(추출/변환 결과)는 업로드 후 15분 지나면 자동
