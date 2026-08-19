@@ -1,4 +1,5 @@
 demucs-env/
+demucs-env-gpu/
 __pycache__/
 *.pyc
 .env

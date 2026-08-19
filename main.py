@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+import torch
 import yt_dlp
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
@@ -56,6 +57,17 @@ DEMUCS_MODEL = "htdemucs_ft"
 DEMUCS_MODEL_PASSES = 4  # htdemucs_ft는 stem별 전담 모델 4개짜리 앙상블이라 진행률 바가 4번 반복됨. DEMUCS_MODEL 바꾸면 같이 바꿀 것.
 PROGRESS_PATTERN = re.compile(r"(\d{1,3})%\|")
 API_KEY = os.getenv("API_KEY")
+
+# CPU 빌드 torch가 깔린 venv(demucs-env, start-server-cpu.bat)로 띄우면 자동으로 cpu,
+# CUDA 빌드 torch가 깔린 venv(demucs-env-gpu, start-server-gpu.bat)로 띄우면 자동으로 cuda가 잡힌다.
+# 요청/응답 형식은 device와 무관하게 완전히 동일 — 어느 배치파일로 켰는지가 유일한 결정 요인.
+DEMUCS_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# GPU는 청크를 여러 개 동시에 밀어넣으면(-j를 CPU처럼 높게 잡으면) 카드에 따라 VRAM이 부족할 수 있어
+# 보수적으로 1로 잡는다. 필요하면 .env의 DEMUCS_GPU_JOBS로 조절 가능.
+DEMUCS_JOBS = os.getenv("DEMUCS_GPU_JOBS", "1") if DEMUCS_DEVICE == "cuda" else "16"
+
+_device_info = f" ({torch.cuda.get_device_name(0)})" if DEMUCS_DEVICE == "cuda" else ""
+print(f"[startup] Demucs device: {DEMUCS_DEVICE}{_device_info}", flush=True)
 
 # yt-dlp가 1800개+ 사이트를 지원하기 때문에 도메인 검증 없이 URL을 넘기면 범용 다운로드
 # 프록시로 악용될 수 있어, 유튜브 도메인만 허용한다.
@@ -140,7 +152,7 @@ class PitchSpeedRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "demucs_device": DEMUCS_DEVICE}
 
 
 @app.post("/separate")
@@ -338,8 +350,8 @@ def run_demucs(job_id: str, input_path: Path, job_output_dir: Path) -> None:
     cmd = [
         sys.executable, "-m", "demucs",
         "-n", DEMUCS_MODEL,
-        "--device", "cpu",
-        "-j", "16",
+        "--device", DEMUCS_DEVICE,
+        "-j", DEMUCS_JOBS,
         "--overlap", "0.5",
         "--mp3", "--mp3-bitrate", "320",
         "-o", str(job_output_dir),

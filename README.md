@@ -1,19 +1,37 @@
 # ait_audio_server
 
 ait_projekt(Next.js)에서 쓰는 오디오 처리 로컬 서버. 음원 분리(Demucs)와 유튜브 오디오 추출을
-담당한다. Windows 로컬 PC(CPU 전용)에서 실행하고, Cloudflare Tunnel로 외부(Vercel에 배포된
-Next.js)에서 접근할 수 있게 한다. (예전 이름: MusicSeparator — 음원 분리 외 기능이 추가되면서 개명함)
+담당한다. Windows 로컬 PC에서 실행하고, Cloudflare Tunnel로 외부(Vercel에 배포된 Next.js)에서
+접근할 수 있게 한다. (예전 이름: MusicSeparator — 음원 분리 외 기능이 추가되면서 개명함)
 
 ## 1. 가상환경 생성 및 패키지 설치
 
-PowerShell 기준:
+PowerShell 기준. **CPU용(`demucs-env`)과 GPU용(`demucs-env-gpu`) 가상환경을 따로 만든다** — 코드는
+완전히 동일하고, 어느 가상환경으로 서버를 띄우느냐(아래 3번의 `start-server-cpu.bat`/`start-server-gpu.bat`)만
+다르다.
 
 ```powershell
 cd E:\ait_audio_server
+
+# CPU용
 python -m venv demucs-env
 .\demucs-env\Scripts\Activate.ps1
 pip install --upgrade pip
 pip install -r requirements.txt
+deactivate
+```
+
+호환되는 NVIDIA GPU(CUDA 지원, 최소 몇 년 이내 세대 — 오래된 카드는 PyTorch가 커널을 안 지원해서 그냥
+CPU로 도는 것과 다를 바 없으니 의미 없음)가 있으면 GPU용도 추가로 만들 수 있다:
+
+```powershell
+# GPU용 (CUDA 빌드 torch를 먼저 설치한 뒤 requirements.txt를 설치해야 CPU 빌드로 덮어써지지 않는다)
+python -m venv demucs-env-gpu
+.\demucs-env-gpu\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+deactivate
 ```
 
 > Demucs가 의존하는 PyTorch는 용량이 크고 설치에 시간이 걸린다(첫 설치 시 수 분~수십 분 소요 가능).
@@ -50,14 +68,17 @@ copy .env.example .env
 Next.js 쪽은 매 요청마다 그 테이블에서 최신 URL을 읽어간다 — 재시작해서 URL이 바뀌어도 손댈 곳이 없다.
 
 ```powershell
-.\demucs-env\Scripts\Activate.ps1
+.\demucs-env\Scripts\Activate.ps1     # 또는 GPU용이면 .\demucs-env-gpu\Scripts\Activate.ps1
 python run.py
 ```
 
-매번 이렇게 치기 번거로우면 `start-server.bat`을 더블클릭하면 새 창에서 켜지고, `stop-server.bat`을
-더블클릭하면 꺼진다(또는 그냥 서버 창을 직접 닫아도 됨).
+매번 이렇게 치기 번거로우면 `start-server-cpu.bat`(또는 `start-server-gpu.bat`)을 더블클릭하면 새 창에서
+켜지고, `stop-server.bat`을 더블클릭하면 꺼진다(또는 그냥 서버 창을 직접 닫아도 됨). 어느 쪽으로 띄웠는지는
+`--device`가 자동으로 그 가상환경의 torch 빌드를 따라가므로(아래 "GPU 모드" 참고) API 요청/응답은 완전히
+동일하다 — Next.js 쪽은 서버가 CPU로 떠있는지 GPU로 떠있는지 신경 쓸 필요 없음.
 
-- `GET /health` — 서버 상태 확인
+- `GET /health` — 서버 상태 확인. `demucs_device`로 현재 CPU/GPU 중 어느 걸로 떠있는지 참고용으로 확인 가능
+  (요청 방식에는 영향 없음, 순수 디버깅/모니터링용).
 - `POST /separate` — JSON `{ "file_url": "https://.../stem-uploads/..." }`, 헤더 `X-API-Key: <API_KEY>` 필요
   → `{"job_id": "...", "status": "queued"}` 반환. 파일 자체를 요청 본문으로 안 받고 URL만 받아서 서버가 직접
   다운로드한다 — Next.js API Route(Vercel Functions)는 요청 본문이 4.5MB로 제한돼 있어서 곡 파일을 그대로
@@ -140,11 +161,17 @@ using (bucket_id = 'stem-uploads');
 
 ## 참고
 
+- **GPU 모드**: `main.py`가 시작할 때 `torch.cuda.is_available()`로 자동 감지해서 `DEMUCS_DEVICE`를
+  `cpu`/`cuda`로, `-j`(병렬 작업 수)도 그에 맞게(CPU 16, GPU 1) 정한다. 즉 코드는 안 건드리고 어느
+  가상환경(`demucs-env` vs `demucs-env-gpu`)으로 서버를 띄웠는지에 따라 자동으로 결정됨 — 1번 항목 참고.
+  GPU 쪽 `-j`(기본 1)는 카드 VRAM에 따라 `.env`의 `DEMUCS_GPU_JOBS`로 조절 가능(값을 올리면 청크를 동시에
+  여러 개 GPU에 밀어넣어 빨라질 수 있지만 VRAM 부족으로 실패할 수도 있음).
 - 모델은 `htdemucs_ft`(4-모델 앙상블 파인튜닝, 품질 우선) 사용 중. `main.py`의 `DEMUCS_MODEL`을 `htdemucs`로
   바꾸면 품질은 약간 떨어지지만 약 4배 빠름.
 - `--overlap 0.5`(기본 0.25)로 구간 경계 이음새 아티팩트를 줄임. 처리해야 할 구간 수가 늘어나 조금 느려지지만
   `--shifts`처럼 배수로 곱해지는 게 아니라 완만하게(대략 1.5배) 늘어나는 정도라 비용 대비 효과가 좋음.
-- 3~5분짜리 곡 기준 CPU 처리 시간 약 3~5분(`htdemucs` 기준. `htdemucs_ft`는 그보다 오래 걸림)
+- 3~5분짜리 곡 기준 CPU 처리 시간 약 3~5분(`htdemucs` 기준. `htdemucs_ft`는 그보다 오래 걸림). GPU는
+  카드에 따라 다르지만 통상 수 초~수십 초 수준으로 훨씬 빠름.
 - 처리 완료/실패 후 로컬 업로드 파일과 Demucs 산출물은 자동 삭제됨(Supabase Storage에만 보관)
 - Supabase Storage 정리: `stem-uploads`(원본)는 다운로드 직후 즉시 삭제, `separated-audio`(결과)는
   업로드 후 1시간 지나면, `youtube-audio`/`pitch-speed-audio`(추출/변환 결과)는 업로드 후 15분 지나면 자동
