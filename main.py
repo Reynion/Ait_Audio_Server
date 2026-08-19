@@ -53,6 +53,7 @@ if FFMPEG_DIR:
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 STEMS = ("vocals", "drums", "bass", "other")
 VALID_STEMS = set(STEMS)
+MIX_VOLUME_RANGE = (0.0, 2.0)
 DEMUCS_MODEL = "htdemucs_ft"
 DEMUCS_MODEL_PASSES = 4  # htdemucs_ft는 stem별 전담 모델 4개짜리 앙상블이라 진행률 바가 4번 반복됨. DEMUCS_MODEL 바꾸면 같이 바꿀 것.
 PROGRESS_PATTERN = re.compile(r"(\d{1,3})%\|")
@@ -137,6 +138,7 @@ class YoutubeAudioRequest(BaseModel):
 class MixItem(BaseModel):
     key: str
     stems: list[str]
+    volumes: dict[str, float] | None = None
 
 
 class MixRequest(BaseModel):
@@ -256,6 +258,20 @@ def mix(
         if unknown:
             raise HTTPException(status_code=400, detail=f"{item.key}: 알 수 없는 stem입니다: {sorted(unknown)}")
 
+        if item.volumes:
+            unknown_volume_stems = set(item.volumes) - set(item.stems)
+            if unknown_volume_stems:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{item.key}: volumes에 stems에 없는 값이 있습니다: {sorted(unknown_volume_stems)}",
+                )
+            for stem, vol in item.volumes.items():
+                if not (MIX_VOLUME_RANGE[0] <= vol <= MIX_VOLUME_RANGE[1]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{item.key}: {stem}의 volume은 {MIX_VOLUME_RANGE[0]}~{MIX_VOLUME_RANGE[1]} 범위여야 합니다.",
+                    )
+
     job_id2 = uuid.uuid4().hex
     jobs.create(job_id2, filename=f"mix of {body.job_id}")
     executor.submit(process_mix_job, job_id2, body.job_id, body.mixes)
@@ -316,16 +332,22 @@ async def pitch_speed(
 INSTRUMENTAL_SOURCE_STEMS = ("drums", "bass", "other")
 
 
-def mix_stems_ffmpeg(inputs: list[Path], output_path: Path) -> bool:
-    """여러 mp3 stem을 재분리 없이 ffmpeg amix로 하나로 섞는다."""
+def mix_stems_ffmpeg(inputs: list[Path], volumes: list[float], output_path: Path) -> bool:
+    """여러 mp3 stem을 재분리 없이 stem별 볼륨(1.0=원곡)을 적용해서 ffmpeg로 하나로 섞는다.
+    입력이 1개면 amix 없이 volume 필터만 적용한다(단일 stem 볼륨 조절용)."""
     cmd = ["ffmpeg", "-y"]
     for p in inputs:
         cmd += ["-i", str(p)]
-    cmd += [
-        "-filter_complex", f"amix=inputs={len(inputs)}:duration=longest:normalize=0",
-        "-b:a", "320k",
-        str(output_path),
-    ]
+
+    if len(inputs) == 1:
+        cmd += ["-af", f"volume={volumes[0]}"]
+    else:
+        parts = [f"[{i}:a]volume={vol}[a{i}]" for i, vol in enumerate(volumes)]
+        labels = "".join(f"[a{i}]" for i in range(len(inputs)))
+        parts.append(f"{labels}amix=inputs={len(inputs)}:duration=longest:normalize=0")
+        cmd += ["-filter_complex", ";".join(parts)]
+
+    cmd += ["-b:a", "320k", str(output_path)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or not output_path.exists():
         print(f"[mix] ffmpeg 믹싱 실패: {result.stderr[-500:]}", flush=True)
@@ -340,7 +362,7 @@ def build_instrumental(stem_dir: Path) -> Path | None:
         return None
 
     output_path = stem_dir / "instrumental.mp3"
-    if not mix_stems_ffmpeg(inputs, output_path):
+    if not mix_stems_ffmpeg(inputs, [1.0] * len(inputs), output_path):
         return None
     return output_path
 
@@ -501,11 +523,13 @@ def process_mix_job(job_id2: str, source_job_id: str, mix_items: list[MixItem]) 
             if len(available) != len(item.stems):
                 continue  # 필요한 stem 중 일부가 만료/누락 -> 이 조합은 스킵
 
-            if len(available) == 1:
+            volumes = [(item.volumes or {}).get(s, 1.0) for s in available]
+            if len(available) == 1 and volumes[0] == 1.0:
+                # 볼륨 조절이 없는 단일 stem은 믹싱 없이 원본 URL을 그대로 재사용(비용 0)
                 urls[item.key] = get_stem_public_url(source_job_id, available[0])
             else:
                 output_path = work_dir / f"mix_{item.key}.mp3"
-                if mix_stems_ffmpeg([stem_paths[s] for s in available], output_path):
+                if mix_stems_ffmpeg([stem_paths[s] for s in available], volumes, output_path):
                     urls[item.key] = upload_mix(source_job_id, item.key, output_path)
 
             jobs.update(job_id2, progress=min(99, 30 + int((i + 1) / total * 69)))
