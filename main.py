@@ -348,7 +348,7 @@ def mix_stems_ffmpeg(inputs: list[Path], volumes: list[float], output_path: Path
         cmd += ["-filter_complex", ";".join(parts)]
 
     cmd += ["-b:a", "320k", str(output_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0 or not output_path.exists():
         print(f"[mix] ffmpeg 믹싱 실패: {result.stderr[-500:]}", flush=True)
         return False
@@ -555,7 +555,7 @@ def run_pitch_speed_ffmpeg(input_path: Path, output_path: Path, tempo: float, pi
         "-b:a", "320k",
         str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0 or not output_path.exists():
         raise RuntimeError(f"피치/속도 조절 실패: {result.stderr[-2000:]}")
 
