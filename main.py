@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from jobs import JobStatus, jobs
 from supabase_client import (
     BUCKET,
+    ENHANCE_BUCKET,
     PITCH_SPEED_BUCKET,
     UPLOAD_BUCKET,
     YOUTUBE_BUCKET,
@@ -30,6 +31,7 @@ from supabase_client import (
     delete_upload,
     download_stem,
     get_stem_public_url,
+    upload_enhanced_audio,
     upload_mix,
     upload_pitch_speed_audio,
     upload_stem,
@@ -91,6 +93,7 @@ UPLOAD_RETENTION_HOURS = 24
 RESULT_RETENTION_HOURS = 1
 YOUTUBE_RETENTION_HOURS = 0.25
 PITCH_SPEED_RETENTION_HOURS = 0.25
+ENHANCE_RETENTION_HOURS = 0.25
 
 app = FastAPI(title="ait_audio_server")
 
@@ -102,9 +105,11 @@ def cleanup_loop() -> None:
             n_results = cleanup_old_objects(BUCKET, RESULT_RETENTION_HOURS / 24)
             n_youtube = cleanup_old_objects(YOUTUBE_BUCKET, YOUTUBE_RETENTION_HOURS / 24)
             n_pitch_speed = cleanup_old_objects(PITCH_SPEED_BUCKET, PITCH_SPEED_RETENTION_HOURS / 24)
+            n_enhance = cleanup_old_objects(ENHANCE_BUCKET, ENHANCE_RETENTION_HOURS / 24)
             print(
                 f"[cleanup] {UPLOAD_BUCKET} {n_uploads}개, {BUCKET} {n_results}개, "
-                f"{YOUTUBE_BUCKET} {n_youtube}개, {PITCH_SPEED_BUCKET} {n_pitch_speed}개 삭제",
+                f"{YOUTUBE_BUCKET} {n_youtube}개, {PITCH_SPEED_BUCKET} {n_pitch_speed}개, "
+                f"{ENHANCE_BUCKET} {n_enhance}개 삭제",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -150,6 +155,10 @@ class PitchSpeedRequest(BaseModel):
     file_url: str
     tempo: float = 1.0
     pitch: float = 0.0
+
+
+class EnhanceDrumsRequest(BaseModel):
+    file_url: str
 
 
 @app.get("/health")
@@ -325,6 +334,40 @@ async def pitch_speed(
 
     jobs.create(job_id, filename=url_path.name or input_path.name)
     executor.submit(process_pitch_speed_job, job_id, input_path, body.tempo, body.pitch)
+
+    return {"job_id": job_id, "status": JobStatus.QUEUED.value}
+
+
+@app.post("/enhance-drums")
+async def enhance_drums(
+    body: EnhanceDrumsRequest,
+    x_api_key: str | None = Header(default=None),
+) -> dict:
+    """분리된 drums stem에 EQ+컴프레서로 트랜지언트(타격 어택)를 강조해서 펀치감/명료함을 근사한다.
+    자동 적용 아님 — 이미 나온 결과물 URL을 받아서 원할 때만 별도로 돌리는 후처리 엔드포인트."""
+    verify_api_key(x_api_key)
+
+    url_path = Path(urlparse(body.file_url).path)
+    ext = url_path.suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="mp3, wav, flac, ogg, m4a 파일만 지원합니다.")
+
+    job_id = uuid.uuid4().hex
+    job_upload_dir = UPLOAD_DIR / job_id
+    job_upload_dir.mkdir(parents=True, exist_ok=True)
+    input_path = job_upload_dir / f"input{ext}"
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(body.file_url)
+            resp.raise_for_status()
+            input_path.write_bytes(resp.content)
+    except httpx.HTTPError as exc:
+        shutil.rmtree(job_upload_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"파일 다운로드 실패: {exc}")
+
+    jobs.create(job_id, filename=url_path.name or input_path.name)
+    executor.submit(process_enhance_drums_job, job_id, input_path)
 
     return {"job_id": job_id, "status": JobStatus.QUEUED.value}
 
@@ -571,6 +614,49 @@ def process_pitch_speed_job(job_id: str, input_path: Path, tempo: float, pitch: 
 
         jobs.update(job_id, status=JobStatus.UPLOADING)
         audio_url = upload_pitch_speed_audio(job_id, output_path)
+
+        jobs.update(job_id, status=JobStatus.COMPLETED, progress=100, urls={"audio": audio_url})
+    except Exception as exc:  # noqa: BLE001
+        jobs.update(job_id, status=JobStatus.FAILED, error=str(exc))
+    finally:
+        shutil.rmtree(input_path.parent, ignore_errors=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def run_enhance_drums_ffmpeg(input_path: Path, output_path: Path) -> None:
+    """ffmpeg에는 전용 트랜지언트 디자이너 필터가 없어서, EQ(어택/펀치 대역 부스트) +
+    느린 어택의 컴프레서(초반 타격음은 그대로 통과시키고 서스테인만 눌러 상대적으로 어택이
+    튀게 함) 조합으로 트랜지언트 셰이핑을 근사한다. 마지막 리미터는 EQ 부스트로 인한
+    과증폭을 안전하게 눌러준다."""
+    audio_filter = (
+        "equalizer=f=90:width_type=o:width=1:g=2,"
+        "equalizer=f=3000:width_type=o:width=1:g=3,"
+        "acompressor=threshold=-18dB:ratio=3:attack=30:release=150,"
+        "alimiter=limit=0.98"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-af", audio_filter,
+        "-b:a", "320k",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0 or not output_path.exists():
+        raise RuntimeError(f"드럼 펀치감 강화 실패: {result.stderr[-2000:]}")
+
+
+def process_enhance_drums_job(job_id: str, input_path: Path) -> None:
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        jobs.update(job_id, status=JobStatus.PROCESSING, progress=20)
+        output_path = job_dir / "output.mp3"
+        run_enhance_drums_ffmpeg(input_path, output_path)
+        jobs.update(job_id, progress=80)
+
+        jobs.update(job_id, status=JobStatus.UPLOADING)
+        audio_url = upload_enhanced_audio(job_id, "drums", output_path)
 
         jobs.update(job_id, status=JobStatus.COMPLETED, progress=100, urls={"audio": audio_url})
     except Exception as exc:  # noqa: BLE001

@@ -58,6 +58,8 @@ copy .env.example .env
   버킷이 없으면 Supabase 대시보드(Storage → New bucket, public으로 생성)에서 미리 만들어야 함.
 - `SUPABASE_PITCH_SPEED_BUCKET`: 기본값 `pitch-speed-audio` — 피치/속도 조절 결과(mp3) 저장용, public.
   마찬가지로 버킷을 미리 만들어야 함.
+- `SUPABASE_ENHANCE_BUCKET`: 기본값 `enhanced-audio` — 드럼 펀치감 강화 등 후처리 결과(mp3) 저장용, public.
+  마찬가지로 버킷을 미리 만들어야 함.
 - `API_KEY`: Cloudflare Tunnel로 외부에 노출되는 서버이므로, 임의의 값을 넣어 인증 없는 요청을 막는 것을 권장.
   설정하면 Next.js 쪽에서 모든 요청에 `X-API-Key` 헤더를 함께 보내야 함.
 
@@ -125,8 +127,18 @@ python run.py
   - `/separate`와 동일하게 `file_url`을 다운로드해서 처리하고, `stem-uploads`에서 온 파일이면 다운로드 직후
     원본을 삭제함.
   - 처리는 `/status`를 그대로 재사용하며, 완료 시 `urls.audio`에 결과 URL 하나만 담김(mp3, 320kbps).
+- `POST /enhance-drums` — JSON `{ "file_url": "https://.../separated-audio/{job_id}/drums.mp3" }`,
+  헤더 `X-API-Key: <API_KEY>` 필요 → `{"job_id": "...", "status": "queued"}` 반환. 분리된 drums stem에
+  EQ(어택/펀치 대역 부스트) + 느린 어택의 컴프레서(초반 타격음은 통과시키고 서스테인만 눌러 상대적으로
+  어택이 튀게 함) + 리미터를 걸어 트랜지언트 셰이핑을 근사한다 — ffmpeg에 전용 트랜지언트 디자이너 필터가
+  없어서 이렇게 조합함. **자동 적용 아님** — `/separate` 결과에 원할 때만 별도로 돌리는 선택적 후처리.
+  - AI 기반 "복원" 계열(AudioSR 등)은 우리 환경에서 속도(수십 분 소요 추정)와 품질(1-step distillation
+    버전들의 실제 품질 검증 부족) 둘 다 리스크가 커서 배제하고, 검증된 전통적 DSP 기법으로 구현함.
+  - vocals/bass/other에는 안 맞는 드럼 전용 튜닝이라 다른 stem에 써도 막지는 않지만 기대한 효과는 안 남.
+  - 처리는 `/status`를 그대로 재사용하며, 완료 시 `urls.audio`에 결과 URL 하나만 담김(mp3, 320kbps).
+  - 실측(크레스트 팩터 11.3→15.5로 상승, 클리핑 없음)으로 의도한 대로 펀치감이 올라가는 것까지 확인함.
 
-동시에 여러 곡/영상/믹스/피치조절을 요청해도 서버 내부에서 워커 1개짜리 큐로 순차 처리한다(CPU 코어를 Demucs
+동시에 여러 곡/영상/믹스/피치조절/드럼강화를 요청해도 서버 내부에서 워커 1개짜리 큐로 순차 처리한다(CPU 코어를 Demucs
 `-j 16`이 이미 최대로 쓰기 때문에 동시 처리 시 오히려 전체 시간이 늘어남 — 다른 기능들도 같은 큐를 공유함).
 
 cloudflared 실행파일이 없다면 아래로 다시 받는다 (`cloudflared/` 폴더는 용량 때문에 git에 커밋하지 않음):
@@ -181,10 +193,11 @@ using (bucket_id = 'stem-uploads');
   달라질 수 있음.
 - 처리 완료/실패 후 로컬 업로드 파일과 Demucs 산출물은 자동 삭제됨(Supabase Storage에만 보관)
 - Supabase Storage 정리: `stem-uploads`(원본)는 다운로드 직후 즉시 삭제, `separated-audio`(결과)는
-  업로드 후 1시간 지나면, `youtube-audio`/`pitch-speed-audio`(추출/변환 결과)는 업로드 후 15분 지나면 자동
-  삭제됨(다시 뽑는 비용이 크지 않아 짧게 잡음). 서버 시작 시 한 번 + 이후 15분마다 정리 스레드가 돎. 보관
-  기간은 `main.py`의 `UPLOAD_RETENTION_HOURS`/`RESULT_RETENTION_HOURS`/`YOUTUBE_RETENTION_HOURS`/
-  `PITCH_SPEED_RETENTION_HOURS`로, 정리 주기는 `CLEANUP_INTERVAL_SECONDS`로 조절 가능.
+  업로드 후 1시간 지나면, `youtube-audio`/`pitch-speed-audio`/`enhanced-audio`(추출/변환/후처리 결과)는
+  업로드 후 15분 지나면 자동 삭제됨(다시 뽑는 비용이 크지 않아 짧게 잡음). 서버 시작 시 한 번 + 이후 15분마다
+  정리 스레드가 돎. 보관 기간은 `main.py`의 `UPLOAD_RETENTION_HOURS`/`RESULT_RETENTION_HOURS`/
+  `YOUTUBE_RETENTION_HOURS`/`PITCH_SPEED_RETENTION_HOURS`/`ENHANCE_RETENTION_HOURS`로, 정리 주기는
+  `CLEANUP_INTERVAL_SECONDS`로 조절 가능.
 - 유튜브 오디오 추출은 `yt-dlp` + FFmpeg(`FFmpegExtractAudio` 후처리)로 mp3 320kbps 변환까지 하므로,
   m4a 디코딩용으로 이미 설정해둔 `FFMPEG_DIR`을 그대로 재사용함(별도 설정 불필요).
 - 피치/속도 조절(`rubberband` 필터)은 winget으로 설치한 Gyan.FFmpeg 빌드에 `--enable-librubberband`가

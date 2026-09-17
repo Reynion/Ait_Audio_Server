@@ -12,6 +12,7 @@ BUCKET = os.getenv("SUPABASE_BUCKET", "separated-audio")
 UPLOAD_BUCKET = os.getenv("SUPABASE_UPLOAD_BUCKET", "stem-uploads")
 YOUTUBE_BUCKET = os.getenv("SUPABASE_YOUTUBE_BUCKET", "youtube-audio")
 PITCH_SPEED_BUCKET = os.getenv("SUPABASE_PITCH_SPEED_BUCKET", "pitch-speed-audio")
+ENHANCE_BUCKET = os.getenv("SUPABASE_ENHANCE_BUCKET", "enhanced-audio")
 
 
 @lru_cache
@@ -91,6 +92,18 @@ def upload_pitch_speed_audio(job_id: str, file_path: Path) -> str:
         {"content-type": "audio/mpeg", "upsert": "true"},
     )
     return client.storage.from_(PITCH_SPEED_BUCKET).get_public_url(storage_path)
+
+
+def upload_enhanced_audio(job_id: str, kind: str, file_path: Path) -> str:
+    client = get_supabase()
+    storage_path = f"{job_id}/{kind}{file_path.suffix}"
+    data = file_path.read_bytes()
+    client.storage.from_(ENHANCE_BUCKET).upload(
+        storage_path,
+        data,
+        {"content-type": "audio/mpeg", "upsert": "true"},
+    )
+    return client.storage.from_(ENHANCE_BUCKET).get_public_url(storage_path)
 
 
 def _extract_storage_path(bucket: str, url: str) -> str | None:
